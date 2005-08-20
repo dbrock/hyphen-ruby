@@ -4,7 +4,7 @@
 
 # Author: Daniel Brockman <daniel@brockman.se>
 # URL: <http://www.brockman.se/software/hyphen-ruby/hyphen-ruby>
-# Updated: Sunday 2005-06-26 22:10
+# Updated: Sunday 2005-08-21 21:10
 
 # This silliness is the result of me trying to move Ruby one
 # additional tiny step in right direction (i.e., towards Lisp).
@@ -74,15 +74,34 @@
 # appear somewhere on the first line, or it won't be loaded properly.
 # (I may consider relaxing this requirement if it gets annoying.)
 
-# So that's about all you have to know to use this thing successfully.
+# ====================================================================
+# WARNING:  The parser considers any slash immediately followed by a
+# non-whitespace character to be the start of a regular expression.
+# This means that you must not write mathematical expressions like
+# `a/b + c*d', which has to be written as `a / b + c * d' instead.
+# ====================================================================
+
+# That's about all you have to know to use this thing successfully.
 # If you're curious about how it works, let me present... the code:
 
 module HyphenRuby
-  class RubyMonster
+  DEV_NULL = Object.new
+  class << DEV_NULL
+    def read ; '' end
+    def write x ; end
+    def << x ; end
+  end
+
+  class Parser
+    class TopicFound < Exception ; end
+
     def initialize options = {}
       @mode = options[:mode] || :dehyphenate
       @file_name = options[:file_name] || '(unknown file)'
       @line = 0
+      @offset = 0
+      @topic_state = :normal
+
       input = options[:input] || STDIN
       output = options[:output] || STDOUT
 
@@ -103,11 +122,22 @@ module HyphenRuby
       end
     end
 
-    def looking_at? pattern
+    def remaining_input
+      @input[@offset .. -1]
+    end
+
+    def match pattern
       case pattern
-      when Regexp : @input =~ pattern
-      when String : @input[0, pattern.size] == pattern
+      when Regexp
+        $& if remaining_input =~ pattern
+      when String
+        pattern if @input[@offset, pattern.size] == pattern
+      else raise ArgumentError
       end
+    end
+
+    def looking_at? pattern
+      match(pattern) != nil
     end
 
     def count_newlines string
@@ -117,20 +147,10 @@ module HyphenRuby
     end
 
     def bite pattern
-      case pattern
-      when Regexp
-        if @input =~ pattern
-          fail 'tried to bite middle of input' unless $`.empty?
-          @input = $'
-          count_newlines $&
-          return $&
-        end
-      when String
-        if @input[0, pattern.size] == pattern
-          @input.slice! 0, pattern.size
-          count_newlines pattern
-          return pattern
-        end
+      if chunk = match(pattern)
+        @offset += chunk.size
+        count_newlines chunk
+        return chunk
       end
     end
 
@@ -167,7 +187,7 @@ module HyphenRuby
       STDOUT.flush ; STDERR.puts ; STDERR.puts
       STDERR.puts "#@file_name:#@line"
       fail "#{reason}:\n" +
-        '-' * 60 + "\n" + @input[0, 50] + "\n" + '-' * 60 + "\n"
+        '-' * 60 + "\n" + @input[@offset, 50] + "\n" + '-' * 60 + "\n"
     end
 
     PAIRS = { '(' => ')', '[' => ']',
@@ -181,21 +201,34 @@ module HyphenRuby
 
     def copying_delimiters
       closing, opening = copy_opening_delimiter
-      yield closing, opening ; copy! closing
+      value = yield closing, opening
+      copy! closing
+      return value
+    end
+
+    def convert_identifier x
+      case @mode
+      when :hyphenate
+        x.gsub /([a-zA-Z0-9])_([a-zA-Z0-9])/, '\1-\2'
+      when :dehyphenate
+        if x =~ /[A-Z]/ and x =~ /[a-z]/
+          x.gsub /([a-zA-Z0-9])-([a-zA-Z0-9])/, '\1\2'
+        else
+          x.gsub /([a-zA-Z0-9])-([a-zA-Z0-9])/, '\1_\2'
+        end
+      else fail end
+    end
+
+    def chew_identifier
+      unless copy(/\A\$[^a-zA-Z]/)
+        chew(/(?:@|@@|\$|:)?[a-zA-Z0-9_-]+[?!]?/) do |x|
+          yield convert_identifier(x)
+        end or choke
+      end
     end
 
     def eat_identifier
-      unless copy(/\A\$[^a-zA-Z]/)
-        chew(/(?:@|@@|\$|:)?[a-zA-Z0-9_-]+[?!]?/) do |chunk|
-          # Here's actually the point of this whole charade:
-          case @mode
-          when :hyphenate
-            chunk.gsub(/([a-zA-Z0-9])_([a-zA-Z0-9])/, '\1-\2')
-          when :dehyphenate
-            chunk.gsub(/([a-zA-Z0-9])-([a-zA-Z0-9])/, '\1_\2')
-          end
-        end or choke
-      end
+      chew_identifier { |x| x }
     end
 
     def eat_hard_string
@@ -231,33 +264,115 @@ module HyphenRuby
       end
     end
 
-    def eat_delimited_program
+    def eat_delimited_program_1
       copying_delimiters { eat_program }
     end
 
+    def looking_at_topicalized_block?
+      if looking_at? '{' and
+          # This is a hack to prevent `%{#{.foo}}' from
+          # expanding into `%{#{|__topic__|__topic__.foo}}'.
+          @input[@offset - 1] != ?#
+      then
+        begin
+          offset = @offset
+          output = @output
+          @output = DEV_NULL
+          topic_state = @topic_state
+          @topic_state = :searching
+          eat_delimited_program_1
+        rescue TopicFound
+          return true
+        else
+          return false
+        ensure
+          @offset = offset
+          @output = output
+          @topic_state = topic_state
+        end
+      end
+    end
+
+    def eat_delimited_program
+      case @topic_state
+      when :normal
+        if looking_at_topicalized_block?
+          copying_delimiters do
+            breathe
+            swallow '|__topic__| '
+            eat_program
+          end
+        else
+          eat_delimited_program_1
+        end
+      when :searching
+        topic_state = @topic_state
+        @topic_state = :skipping
+        eat_delimited_program_1
+        @topic_state = topic_state
+      when :skipping
+        eat_delimited_program_1
+      end
+    end
+
     def eat_program
-      while not @input.empty? do
+      while @offset < @input.size do
         breathe
-        case @input
+        case @input[@offset .. -1]
+#         when pattern = /\A(module|class)\s+([\w-]+[_-][\w-]+)\b/
+#           keyword = $1
+#           converted = convert_identifier $2
+#           camelcased = $2.gsub /-|_/, ''
+#           bite pattern
+#           swallow "#{keyword} #{converted} ; end\n"
+#           swallow "#{camelcased} = #{converted}\n"
+#           swallow "#{keyword} #{converted}"
+        when pattern = /\Aand\s+then\b/
+          bite pattern
+          swallow 'or true and'
+        when pattern = /\A(<>|\$-)/
+          if @topic_state == :searching
+            raise TopicFound
+          else
+            bite pattern
+            swallow '__topic__'
+          end
+        when /\A\.(?=\w)/
+          if @offset > 0 and @input[@offset - 1].chr =~ /^[\[({\s]$/
+            if @topic_state == :searching
+              raise TopicFound
+            else
+              swallow '__topic__'
+            end
+          end
+          copy '.'
         when /\A([a-zA-Z_$]|[:@][a-zA-Z])/
           eat_identifier
-        when /\A('|%[qw])/ ; copy(/\A%./)
+        when /\A('|%[qw])/
+          copy(/\A%./)
           eat_hard_string
-        when /\A(["`]|%[Qx]|%[^a-zA-Z0-9]|\/\S)/ ; copy(/\A%[a-zA-Z0-9]?/)
+        when /\A(["`]|%[Qx]|%[^a-zA-Z0-9]|\/\S)/
+          copy(/\A%[a-zA-Z0-9]?/)
           eat_soft_string
         when /\A[\[({]/
           eat_delimited_program
+        when /\A~:/
+          bite '~'
+          chew_identifier { |x| x + ' => ' + x[1 .. -1] }
+        when pattern = /\A<-(?=\s)/
+          bite pattern
+          swallow '='
         else
           break unless copy(/\A\\./m) or copy(/\A\?(\S|\\.)/m) or
             copy(/\A(0[box])?([0-9a-f]_?)+(\.([0-9a-f]_?))?\b/i) or
-            copy(/\A[-+\/*%=&|^!?~><,.;:]/)
+            copy(/\A\.{2,3}/) or copy(/\A[-+\/*%=&|^!?~><,.;:]/)
         end
       end
     end
 
     def eat_input
       eat_program
-      choke unless @input.empty?
+      choke if @offset < @input.size
     end
   end
 
@@ -266,8 +381,8 @@ module HyphenRuby
       base_name
     else
       for directory in $: do
-        for extension in ['', '.rb', '.o', '.dll', '.so'] do
-          file_name = File.join directory, base_name + extension
+        for extension in ['.hrb', '.rb', '.o', '.dll', '.so', ''] do
+          file_name = File.join(directory, base_name + extension)
           if FileTest.exists? file_name
             a = File.expand_path file_name
             b = File.expand_path base_name
@@ -275,6 +390,7 @@ module HyphenRuby
           end
         end
       end
+      return base_name
     end
   end
 
@@ -285,15 +401,13 @@ module HyphenRuby
   end
 
   def self.load_hyphen_ruby file_name
-    open file_name do |file|
-      input = file.read
-      input.sub! /^__END__$/, ''
-      output = String.new
-      monster = RubyMonster.new \
-        :input => input, :file_name => file_name, :output => output
-      monster.eat_input
-      Object.module_eval output, file_name, 1
-    end
+    input = open file_name do |file| file.read end
+    input.sub! /^__END__$/, ''
+    output = String.new
+    parser = Parser.new \
+    :input => input, :file_name => file_name, :output => output
+    parser.eat_input
+    Object.module_eval output, file_name, 1
   end
 
   def self.load base_name
@@ -307,7 +421,7 @@ module HyphenRuby
 
   def self.require base_name
     if $".include? base_name
-      return true
+      return false
     else
       file_name = find_file base_name
       if hyphen_ruby_file? file_name
@@ -324,6 +438,47 @@ module HyphenRuby
     end
   end
 end
+
+# class Module
+#   def hyphenate_constants
+#     for old_name in constants do
+#       new_name = old_name.gsub /\B[A-Z][a-z]/, '_\0'
+#       next if new_name == old_name
+#       old_value = const_get old_name
+#       if const_defined? new_name
+#         new_value = const_get new_name
+#         next if new_value == old_value
+#         $stderr.puts "hyphen-ruby: warning: both `#{name}::#{old_name}' " +
+#           "and `#{name}::#{new_name}' are defined, and their values differ"
+#       else
+#         const_set new_name, old_value
+#       end
+#     end
+#   end
+
+#   def hyphenate_methods
+#     for old_name in instance_methods do
+#       new_name = old_name.gsub(/\B[A-Z][a-z]/, '_\0').downcase
+#       next if new_name == old_name
+#       if method_defined? new_name
+#         $stderr.puts "hyphen-ruby: warning: both `#{name}##{old_name}' " +
+#           "and `#{name}##{new_name}' are defined (but may be aliases)"
+#       else
+#         alias_method new_name, old_value
+#       end
+#     end
+#   end
+
+#   def hyphenate acc = []
+#     constants.map { |x| const_get x }.
+#       select { |x| x.kind_of? Module }.
+#       # Avoid infinite recursion by only processing each module once.
+#       reject { |x| acc.include? x }.
+#       uniq.each { |x| x.hyphenate acc << x }
+#     hyphenate_constants
+#     hyphenate_methods
+#   end
+# end
 
 if __FILE__ == $0
   require 'optparse'
@@ -368,10 +523,14 @@ EOS
     exit 1
   end
 
-  monster = HyphenRuby::RubyMonster.new \
+  parser = HyphenRuby::Parser.new \
     :input => input, :file_name => file_name,
     :output => output, :mode => mode
-  monster.eat_input
+  begin
+    parser.eat_input
+  rescue Interrupt
+    puts "#$0: interrupted with the following input unparsed:\n", parser.remaining_input
+  end
 else
   alias __hyphen_ruby_load load
   def load base_name, wrap = nil
@@ -390,4 +549,5 @@ because the `wrap\' parameter is currently not supported'
   end
 
   HyphenRuby.load $0
+  exit 0
 end
